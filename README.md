@@ -5,12 +5,68 @@ A smart contract-based escrow service built on Stacks blockchain using Clarity. 
 ## 🚀 Features
 
 - **💰 Secure Fund Holding**: Funds are held in the contract until both parties confirm service completion
+- **🎯 Milestone Payments**: Break large projects into smaller, manageable payment stages
 - **🤝 Two-Party Confirmation**: Both buyer and seller must confirm service delivery for fund release
-- **⚖️ Dispute Resolution**: Built-in arbitration system for handling conflicts
+- **⚖️ Dispute Resolution**: Built-in arbitration system for handling conflicts (per milestone or full escrow)
 - **⏰ Emergency Cancellation**: Time-based emergency cancellation after dispute period
-- **📊 Transparent Tracking**: Full visibility into escrow status and history
+- **📊 Transparent Tracking**: Full visibility into escrow status and milestone progress
 
 ## 📋 Contract Functions
+
+### 🎯 Milestone Escrow Functions
+
+#### `create-milestone-escrow`
+Creates a milestone-based escrow with multiple payment stages
+```clarity
+(create-milestone-escrow seller milestone-amounts milestone-descriptions)
+```
+- **seller**: Principal address of the service provider
+- **milestone-amounts**: List of STX amounts for each milestone (in microSTX)
+- **milestone-descriptions**: List of descriptions for each milestone (max 128 chars each)
+
+#### `confirm-milestone`
+Confirms completion of a specific milestone (called by buyer or seller)
+```clarity
+(confirm-milestone escrow-id milestone-index)
+```
+- **escrow-id**: Unique identifier of the escrow
+- **milestone-index**: Index of the milestone to confirm (starts from 0)
+
+#### `raise-milestone-dispute`
+Raises a dispute for a specific milestone
+```clarity
+(raise-milestone-dispute escrow-id milestone-index arbiter)
+```
+- **escrow-id**: Unique identifier of the escrow
+- **milestone-index**: Index of the disputed milestone
+- **arbiter**: Principal address of the dispute resolver
+
+#### `resolve-milestone-dispute`
+Resolves a milestone dispute (called by arbiter only)
+```clarity
+(resolve-milestone-dispute escrow-id milestone-index award-to-seller)
+```
+- **escrow-id**: Unique identifier of the escrow
+- **milestone-index**: Index of the disputed milestone
+- **award-to-seller**: Boolean indicating if milestone funds should go to seller
+
+#### `get-milestone`
+Returns milestone details
+```clarity
+(get-milestone escrow-id milestone-index)
+```
+
+#### `get-milestone-count`
+Returns number of milestones for an escrow
+```clarity
+(get-milestone-count escrow-id)
+```
+
+#### `get-releasable-amount`
+Returns the total STX amount ready to be released (confirmed but not yet released)
+```clarity
+(get-releasable-amount escrow-id)
+```
 
 ### Public Functions
 
@@ -88,6 +144,29 @@ Returns the STX balance held for an escrow
 
 ## 🛠️ Usage Examples
 
+### Creating a Milestone Escrow
+```clarity
+;; Buyer creates milestone escrow for website development
+;; 3 milestones: 300 STX (design), 400 STX (development), 300 STX (deployment)
+(contract-call? .escrow create-milestone-escrow 
+    'SP2J6ZY48GV1EZ5V2V5RB9MP66SW86PYKKNRV9EJ7 
+    (list u300000000 u400000000 u300000000)
+    (list "UI/UX Design" "Frontend Development" "Deployment & Testing")
+)
+```
+
+### Confirming Milestone Completion
+```clarity
+;; Both buyer and seller confirm milestone 0 (design phase)
+(contract-call? .escrow confirm-milestone u1 u0)
+```
+
+### Raising Milestone Dispute
+```clarity
+;; Buyer disputes milestone 1 (development phase)
+(contract-call? .escrow raise-milestone-dispute u1 u1 'SP3FBR2AGK5H9QBDH3EEN6DF8EK8JY7RX8QJ5SVTE)
+```
+
 ### Creating an Escrow
 ```clarity
 ;; Buyer creates escrow for 1000 STX
@@ -136,6 +215,9 @@ clarinet test
 - `u107`: Insufficient balance
 - `u108`: Dispute period not passed
 - `u109`: Already disputed
+- `u110`: Milestone not found
+- `u111`: Milestone already released
+- `u112`: Invalid milestone data
 
 ## 🚧 Security Considerations
 

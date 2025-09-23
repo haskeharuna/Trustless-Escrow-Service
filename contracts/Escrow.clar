@@ -9,6 +9,9 @@
 (define-constant ERR-INSUFFICIENT-BALANCE (err u107))
 (define-constant ERR-DISPUTE-PERIOD-NOT-PASSED (err u108))
 (define-constant ERR-ALREADY-DISPUTED (err u109))
+(define-constant ERR-MILESTONE-NOT-FOUND (err u110))
+(define-constant ERR-MILESTONE-ALREADY-RELEASED (err u111))
+(define-constant ERR-INVALID-MILESTONE-DATA (err u112))
 
 (define-constant PHASE-PENDING u0)
 (define-constant PHASE-ACTIVE u1)
@@ -36,6 +39,16 @@
 
 (define-map user-escrows principal (list 50 uint))
 (define-map escrow-balances uint uint)
+(define-map milestones {escrow-id: uint, index: uint} {
+    amount: uint,
+    description: (string-ascii 128),
+    released: bool,
+    disputed: bool,
+    buyer-confirmed: bool,
+    seller-confirmed: bool,
+    arbiter: (optional principal)
+})
+(define-map milestone-counts uint uint)
 
 (define-public (create-escrow (seller principal) (amount uint) (service-description (string-ascii 256)))
     (let (
@@ -76,6 +89,58 @@
     )
 )
 
+(define-public (create-milestone-escrow (seller principal) (milestone-amounts (list 20 uint)) (milestone-descriptions (list 20 (string-ascii 128))))
+    (let (
+        (escrow-id (var-get next-escrow-id))
+        (total-amount (fold + milestone-amounts u0))
+        (milestone-count (len milestone-amounts))
+        (current-balance (stx-get-balance tx-sender))
+    )
+    (asserts! (> milestone-count u0) ERR-INVALID-MILESTONE-DATA)
+    (asserts! (is-eq milestone-count (len milestone-descriptions)) ERR-INVALID-MILESTONE-DATA)
+    (asserts! (> total-amount u0) ERR-INVALID-AMOUNT)
+    (asserts! (>= current-balance total-amount) ERR-INSUFFICIENT-BALANCE)
+    (asserts! (not (is-eq tx-sender seller)) ERR-UNAUTHORIZED)
+    (asserts! (fold and (map > milestone-amounts (list u0 u0 u0 u0 u0 u0 u0 u0 u0 u0 u0 u0 u0 u0 u0 u0 u0 u0 u0 u0)) true) ERR-INVALID-AMOUNT)
+    
+    (try! (stx-transfer? total-amount tx-sender (as-contract tx-sender)))
+    
+    (map-set escrows escrow-id {
+        buyer: tx-sender,
+        seller: seller,
+        amount: total-amount,
+        phase: PHASE-ACTIVE,
+        created-at: stacks-block-height,
+        service-description: "Milestone-based escrow",
+        buyer-confirmed: false,
+        seller-confirmed: false,
+        dispute-raised-at: none,
+        arbiter: none
+    })
+    
+    (map-set escrow-balances escrow-id total-amount)
+    (map-set milestone-counts escrow-id milestone-count)
+    
+    (fold store-milestone-fold 
+        (map create-milestone-tuple 
+             milestone-amounts 
+             milestone-descriptions 
+             (list u0 u1 u2 u3 u4 u5 u6 u7 u8 u9 u10 u11 u12 u13 u14 u15 u16 u17 u18 u19))
+        {escrow-id: escrow-id, success: true})
+    
+    (let (
+        (buyer-escrows (default-to (list) (map-get? user-escrows tx-sender)))
+        (seller-escrows (default-to (list) (map-get? user-escrows seller)))
+    )
+        (map-set user-escrows tx-sender (unwrap! (as-max-len? (append buyer-escrows escrow-id) u50) ERR-UNAUTHORIZED))
+        (map-set user-escrows seller (unwrap! (as-max-len? (append seller-escrows escrow-id) u50) ERR-UNAUTHORIZED))
+    )
+    
+    (var-set next-escrow-id (+ escrow-id u1))
+    (ok escrow-id)
+    )
+)
+
 (define-public (confirm-service (escrow-id uint))
     (let (
         (escrow-data (unwrap! (map-get? escrows escrow-id) ERR-ESCROW-NOT-FOUND))
@@ -101,6 +166,41 @@
     (let ((updated-escrow (unwrap! (map-get? escrows escrow-id) ERR-ESCROW-NOT-FOUND)))
         (if (and (get buyer-confirmed updated-escrow) (get seller-confirmed updated-escrow))
             (complete-escrow escrow-id)
+            (ok true)
+        )
+    )
+    )
+)
+
+(define-public (confirm-milestone (escrow-id uint) (milestone-index uint))
+    (let (
+        (escrow-data (unwrap! (map-get? escrows escrow-id) ERR-ESCROW-NOT-FOUND))
+        (milestone-key {escrow-id: escrow-id, index: milestone-index})
+        (milestone-data (unwrap! (map-get? milestones milestone-key) ERR-MILESTONE-NOT-FOUND))
+        (caller tx-sender)
+    )
+    (asserts! (is-eq (get phase escrow-data) PHASE-ACTIVE) ERR-WRONG-PHASE)
+    (asserts! (or (is-eq caller (get buyer escrow-data)) 
+                  (is-eq caller (get seller escrow-data))) ERR-NOT-PARTICIPANT)
+    (asserts! (not (get released milestone-data)) ERR-MILESTONE-ALREADY-RELEASED)
+    (asserts! (not (get disputed milestone-data)) ERR-WRONG-PHASE)
+    
+    (if (is-eq caller (get buyer escrow-data))
+        (begin
+            (asserts! (not (get buyer-confirmed milestone-data)) ERR-ALREADY-CONFIRMED)
+            (map-set milestones milestone-key 
+                (merge milestone-data { buyer-confirmed: true }))
+        )
+        (begin
+            (asserts! (not (get seller-confirmed milestone-data)) ERR-ALREADY-CONFIRMED)
+            (map-set milestones milestone-key 
+                (merge milestone-data { seller-confirmed: true }))
+        )
+    )
+    
+    (let ((updated-milestone (unwrap! (map-get? milestones milestone-key) ERR-MILESTONE-NOT-FOUND)))
+        (if (and (get buyer-confirmed updated-milestone) (get seller-confirmed updated-milestone))
+            (release-milestone-funds escrow-id milestone-index)
             (ok true)
         )
     )
@@ -157,6 +257,63 @@
     )
 )
 
+(define-public (raise-milestone-dispute (escrow-id uint) (milestone-index uint) (arbiter principal))
+    (let (
+        (escrow-data (unwrap! (map-get? escrows escrow-id) ERR-ESCROW-NOT-FOUND))
+        (milestone-key {escrow-id: escrow-id, index: milestone-index})
+        (milestone-data (unwrap! (map-get? milestones milestone-key) ERR-MILESTONE-NOT-FOUND))
+        (caller tx-sender)
+    )
+    (asserts! (is-eq (get phase escrow-data) PHASE-ACTIVE) ERR-WRONG-PHASE)
+    (asserts! (or (is-eq caller (get buyer escrow-data)) 
+                  (is-eq caller (get seller escrow-data))) ERR-NOT-PARTICIPANT)
+    (asserts! (not (get released milestone-data)) ERR-MILESTONE-ALREADY-RELEASED)
+    (asserts! (not (get disputed milestone-data)) ERR-ALREADY-DISPUTED)
+    
+    (map-set milestones milestone-key 
+        (merge milestone-data { 
+            disputed: true,
+            arbiter: (some arbiter)
+        }))
+    (map-set escrows escrow-id (merge escrow-data { phase: PHASE-DISPUTED }))
+    (ok true)
+    )
+)
+
+(define-public (resolve-milestone-dispute (escrow-id uint) (milestone-index uint) (award-to-seller bool))
+    (let (
+        (escrow-data (unwrap! (map-get? escrows escrow-id) ERR-ESCROW-NOT-FOUND))
+        (milestone-key {escrow-id: escrow-id, index: milestone-index})
+        (milestone-data (unwrap! (map-get? milestones milestone-key) ERR-MILESTONE-NOT-FOUND))
+        (caller tx-sender)
+        (arbiter (unwrap! (get arbiter milestone-data) ERR-UNAUTHORIZED))
+    )
+    (asserts! (is-eq (get phase escrow-data) PHASE-DISPUTED) ERR-WRONG-PHASE)
+    (asserts! (is-eq caller arbiter) ERR-UNAUTHORIZED)
+    (asserts! (get disputed milestone-data) ERR-WRONG-PHASE)
+    
+    (if award-to-seller
+        (begin
+            (map-set milestones milestone-key 
+                (merge milestone-data { 
+                    disputed: false,
+                    buyer-confirmed: true,
+                    seller-confirmed: true
+                }))
+            (release-milestone-funds escrow-id milestone-index)
+        )
+        (begin
+            (map-set milestones milestone-key 
+                (merge milestone-data { 
+                    disputed: false,
+                    released: true
+                }))
+            (ok true)
+        )
+    )
+    )
+)
+
 (define-public (emergency-cancel (escrow-id uint))
     (let (
         (escrow-data (unwrap! (map-get? escrows escrow-id) ERR-ESCROW-NOT-FOUND))
@@ -170,6 +327,56 @@
     (asserts! (>= (- stacks-block-height (unwrap-panic dispute-time)) DISPUTE-PERIOD) ERR-DISPUTE-PERIOD-NOT-PASSED)
     
     (refund-buyer escrow-id)
+    )
+)
+
+(define-private (release-milestone-funds (escrow-id uint) (milestone-index uint))
+    (let (
+        (escrow-data (unwrap! (map-get? escrows escrow-id) ERR-ESCROW-NOT-FOUND))
+        (milestone-key {escrow-id: escrow-id, index: milestone-index})
+        (milestone-data (unwrap! (map-get? milestones milestone-key) ERR-MILESTONE-NOT-FOUND))
+        (milestone-amount (get amount milestone-data))
+        (current-balance (unwrap! (map-get? escrow-balances escrow-id) ERR-ESCROW-NOT-FOUND))
+    )
+    (try! (as-contract (stx-transfer? milestone-amount tx-sender (get seller escrow-data))))
+    (map-set milestones milestone-key (merge milestone-data { released: true }))
+    (map-set escrow-balances escrow-id (- current-balance milestone-amount))
+    
+    (if (is-eq (- current-balance milestone-amount) u0)
+        (begin
+            (map-set escrows escrow-id (merge escrow-data { phase: PHASE-COMPLETED }))
+            (map-delete escrow-balances escrow-id)
+        )
+        true
+    )
+    (ok true)
+    )
+)
+
+(define-private (create-milestone-tuple (amount uint) (description (string-ascii 128)) (index uint))
+    {amount: amount, description: description, index: index}
+)
+
+(define-private (store-milestone-fold (milestone-tuple {amount: uint, description: (string-ascii 128), index: uint}) 
+                                     (acc {escrow-id: uint, success: bool}))
+    (let ((escrow-id (get escrow-id acc)))
+        (if (> (get amount milestone-tuple) u0)
+            (begin
+                (map-set milestones 
+                    {escrow-id: escrow-id, index: (get index milestone-tuple)} 
+                    {
+                        amount: (get amount milestone-tuple),
+                        description: (get description milestone-tuple),
+                        released: false,
+                        disputed: false,
+                        buyer-confirmed: false,
+                        seller-confirmed: false,
+                        arbiter: none
+                    })
+                acc
+            )
+            acc
+        )
     )
 )
 
@@ -250,4 +457,16 @@
 
 (define-read-only (get-contract-balance)
     (stx-get-balance (as-contract tx-sender))
+)
+
+(define-read-only (get-milestone (escrow-id uint) (milestone-index uint))
+    (map-get? milestones {escrow-id: escrow-id, index: milestone-index})
+)
+
+(define-read-only (get-milestone-count (escrow-id uint))
+    (default-to u0 (map-get? milestone-counts escrow-id))
+)
+
+(define-read-only (get-releasable-amount (escrow-id uint))
+    (default-to u0 (map-get? escrow-balances escrow-id))
 )
