@@ -11,7 +11,9 @@
 (define-constant ERR-ALREADY-DISPUTED (err u109))
 (define-constant ERR-MILESTONE-NOT-FOUND (err u110))
 (define-constant ERR-MILESTONE-ALREADY-RELEASED (err u111))
-(define-constant ERR-INVALID-MILESTONE-DATA (err u112))
+(define-constant ERR-MILESTONE-INVALID-DATA (err u112))
+(define-constant ERR-INVALID-FEE (err u1007))
+(define-constant ERR-OWNER-ONLY (err u1008))
 
 (define-constant PHASE-PENDING u0)
 (define-constant PHASE-ACTIVE u1)
@@ -21,8 +23,13 @@
 (define-constant PHASE-CANCELLED u5)
 
 (define-constant DISPUTE-PERIOD u144)
+(define-constant MAX-FEE-PERCENTAGE u500)
+(define-constant ERR-FEE-EXCEEDED (err u113))
 
 (define-data-var next-escrow-id uint u1)
+
+(define-map arbiter-fees principal uint)
+(define-map arbiter-earnings principal uint)
 
 (define-map escrows uint {
     buyer: principal,
@@ -49,6 +56,58 @@
     arbiter: (optional principal)
 })
 (define-map milestone-counts uint uint)
+(define-map arbiter-payments {escrow-id: uint} {arbiter: principal, amount: uint, paid: bool})
+
+(define-data-var fee-percentage uint u100)
+(define-data-var fee-enabled bool true)
+(define-data-var platform-recipient principal tx-sender)
+
+(define-private (calculate-fee (escrow-amount uint))
+  (let (
+    (fee-rate (var-get fee-percentage))
+  )
+  (/ (* escrow-amount fee-rate) u10000)
+  )
+)
+
+(define-private (collect-platform-fee (escrow-id uint) (total-amount uint))
+  (let (
+    (fee-active (var-get fee-enabled))
+    (fee-amount (calculate-fee total-amount))
+    (recipient (var-get platform-recipient))
+  )
+  (if (and fee-active (> fee-amount u0))
+    (begin
+      (try! (as-contract (stx-transfer? fee-amount tx-sender recipient)))
+      (ok fee-amount)
+    )
+    (ok u0)
+  )
+  )
+)
+
+(define-private (collect-arbiter-fee (escrow-id uint) (total-amount uint) (arbiter principal))
+  (let (
+    (fee-active (var-get fee-enabled))
+    (total-fee (calculate-fee total-amount))
+    (arbiter-portion (/ total-fee u2))
+    (platform-portion (- total-fee arbiter-portion))
+    (recipient (var-get platform-recipient))
+  )
+  (if (and fee-active (> total-fee u0))
+    (begin
+      (try! (as-contract (stx-transfer? arbiter-portion tx-sender arbiter)))
+      (try! (as-contract (stx-transfer? platform-portion tx-sender recipient)))
+      (map-set arbiter-payments
+        {escrow-id: escrow-id}
+        {arbiter: arbiter, amount: arbiter-portion, paid: true}
+      )
+      (ok total-fee)
+    )
+    (ok u0)
+  )
+  )
+)
 
 (define-public (create-escrow (seller principal) (amount uint) (service-description (string-ascii 256)))
     (let (
@@ -96,8 +155,8 @@
         (milestone-count (len milestone-amounts))
         (current-balance (stx-get-balance tx-sender))
     )
-    (asserts! (> milestone-count u0) ERR-INVALID-MILESTONE-DATA)
-    (asserts! (is-eq milestone-count (len milestone-descriptions)) ERR-INVALID-MILESTONE-DATA)
+    (asserts! (> milestone-count u0) ERR-MILESTONE-INVALID-DATA)
+    (asserts! (is-eq milestone-count (len milestone-descriptions)) ERR-MILESTONE-INVALID-DATA)
     (asserts! (> total-amount u0) ERR-INVALID-AMOUNT)
     (asserts! (>= current-balance total-amount) ERR-INSUFFICIENT-BALANCE)
     (asserts! (not (is-eq tx-sender seller)) ERR-UNAUTHORIZED)
@@ -244,6 +303,45 @@
     )
 )
 
+(define-public (set-fee-config (new-fee-percentage uint) (enabled bool) (recipient principal))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-OWNER-ONLY)
+    (asserts! (<= new-fee-percentage u1000) ERR-INVALID-FEE)
+    (var-set fee-percentage new-fee-percentage)
+    (var-set fee-enabled enabled)
+    (var-set platform-recipient recipient)
+    (ok true)
+  )
+)
+
+(define-read-only (get-fee-config)
+  {
+    percentage: (var-get fee-percentage),
+    enabled: (var-get fee-enabled),
+    recipient: (var-get platform-recipient)
+  }
+)
+
+(define-read-only (get-fee-percentage)
+  (var-get fee-percentage)
+)
+
+(define-read-only (is-fee-enabled)
+  (var-get fee-enabled)
+)
+
+(define-read-only (get-platform-recipient)
+  (var-get platform-recipient)
+)
+
+(define-public (set-arbiter-fee (arbiter-fee-pct uint))
+    (begin
+        (asserts! (<= arbiter-fee-pct MAX-FEE-PERCENTAGE) ERR-FEE-EXCEEDED)
+        (map-set arbiter-fees tx-sender arbiter-fee-pct)
+        (ok true)
+    )
+)
+
 (define-public (cancel-escrow (escrow-id uint))
     (let (
         (escrow-data (unwrap! (map-get? escrows escrow-id) ERR-ESCROW-NOT-FOUND))
@@ -337,8 +435,9 @@
         (milestone-data (unwrap! (map-get? milestones milestone-key) ERR-MILESTONE-NOT-FOUND))
         (milestone-amount (get amount milestone-data))
         (current-balance (unwrap! (map-get? escrow-balances escrow-id) ERR-ESCROW-NOT-FOUND))
+        (net-amount (unwrap! (collect-fees-on-milestone escrow-id milestone-amount) ERR-ESCROW-NOT-FOUND))
     )
-    (try! (as-contract (stx-transfer? milestone-amount tx-sender (get seller escrow-data))))
+    (try! (as-contract (stx-transfer? net-amount tx-sender (get seller escrow-data))))
     (map-set milestones milestone-key (merge milestone-data { released: true }))
     (map-set escrow-balances escrow-id (- current-balance milestone-amount))
     
@@ -391,9 +490,10 @@
 (define-private (release-funds-to-seller (escrow-id uint))
     (let (
         (escrow-data (unwrap! (map-get? escrows escrow-id) ERR-ESCROW-NOT-FOUND))
-        (amount (unwrap! (map-get? escrow-balances escrow-id) ERR-ESCROW-NOT-FOUND))
+        (total-amount (unwrap! (map-get? escrow-balances escrow-id) ERR-ESCROW-NOT-FOUND))
+        (net-amount (unwrap! (collect-fees-on-resolution escrow-id total-amount) ERR-ESCROW-NOT-FOUND))
     )
-    (try! (as-contract (stx-transfer? amount tx-sender (get seller escrow-data))))
+    (try! (as-contract (stx-transfer? net-amount tx-sender (get seller escrow-data))))
     (map-set escrows escrow-id (merge escrow-data { phase: PHASE-COMPLETED }))
     (map-delete escrow-balances escrow-id)
     (ok true)
@@ -469,4 +569,66 @@
 
 (define-read-only (get-releasable-amount (escrow-id uint))
     (default-to u0 (map-get? escrow-balances escrow-id))
+)
+
+(define-read-only (get-fee-amount (arbiter (optional principal)) (amount uint))
+    (match arbiter
+        arb-principal
+        (let ((fee-pct (default-to u0 (map-get? arbiter-fees arb-principal))))
+            (/ (* amount fee-pct) u10000)
+        )
+        u0
+    )
+)
+
+(define-read-only (get-arbiter-fee (arbiter principal))
+    (ok (default-to u0 (map-get? arbiter-fees arbiter)))
+)
+
+(define-read-only (get-arbiter-earnings (arbiter principal))
+    (ok (default-to u0 (map-get? arbiter-earnings arbiter)))
+)
+
+(define-private (collect-fees-on-resolution (escrow-id uint) (amount uint))
+    (let (
+        (escrow-data (unwrap! (map-get? escrows escrow-id) ERR-ESCROW-NOT-FOUND))
+        (arbiter (get arbiter escrow-data))
+        (fee-amount (get-fee-amount arbiter amount))
+        (net-amount (- amount fee-amount))
+    )
+    (if (and (is-some arbiter) (> fee-amount u0))
+        (begin
+            (try! (as-contract (stx-transfer? fee-amount tx-sender (unwrap-panic arbiter))))
+            (map-set arbiter-earnings (unwrap-panic arbiter)
+                (+ (default-to u0 (map-get? arbiter-earnings (unwrap-panic arbiter))) fee-amount)
+            )
+            (ok net-amount)
+        )
+        (ok amount)
+    )
+    )
+)
+
+(define-private (collect-fees-on-milestone (escrow-id uint) (amount uint))
+    (let (
+        (escrow-data (unwrap! (map-get? escrows escrow-id) ERR-ESCROW-NOT-FOUND))
+        (arbiter (get arbiter escrow-data))
+        (fee-amount (get-fee-amount arbiter amount))
+        (net-amount (- amount fee-amount))
+    )
+    (if (and (is-some arbiter) (> fee-amount u0))
+        (begin
+            (try! (as-contract (stx-transfer? fee-amount tx-sender (unwrap-panic arbiter))))
+            (map-set arbiter-earnings (unwrap-panic arbiter)
+                (+ (default-to u0 (map-get? arbiter-earnings (unwrap-panic arbiter))) fee-amount)
+            )
+            (ok net-amount)
+        )
+        (ok amount)
+    )
+    )
+)
+
+(define-read-only (get-arbiter-payment (escrow-id uint))
+  (map-get? arbiter-payments {escrow-id: escrow-id})
 )
